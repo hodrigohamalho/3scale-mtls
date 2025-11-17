@@ -1,0 +1,298 @@
+= 3scale mTLS 
+:doctype: book
+:toc: left
+:toclevels: 3
+:icons: font
+:source-highlighter: coderay
+:sectnums:
+
+== Introdução
+
+Este workshop demonstra como configurar mutual TLS (mTLS) diretamente no APIcast.
+
+O fluxo é:
+
+1. O cliente estabelece uma conexão HTTPS com certificado.
+2. O APIcast valida o certificado usando CA configurada.
+3. O tráfego autorizado segue para o backend definido no 3scale.
+
+== Arquitetura Simplificada
+
+* O cliente envia HTTPS + Certificado.
+* A Route do OpenShift está em modo passthrough (não termina TLS).
+* O APIcast recebe o TLS direto e valida o certificado.
+* O APIcast faz a autorização no 3scale e encaminha o tráfego.
+
+== Objetivos do Workshop
+
+* Criar certificados (CA, server, client)
+* Configurar APIcast para servir HTTPS e exigir client certificate
+* Montar certificados via secrets
+* Criar Route passthrough
+* Validar chamadas com e sem certificado
+* (Opcional) Autenticar no 3scale baseado no DN do certificado
+
+== Instalando o 3Scale (Non Prod)
+
+oc create -f 01-system-storage.yaml
+oc create -f 02-apimanager-cr.yaml
+
+== Criando os Certificados
+
+=== Criar CA
+
+[source,bash]
+----
+openssl genrsa -out ca.key 4096
+
+openssl req -x509 -new -nodes \
+  -key ca.key \
+  -sha256 \
+  -days 3650 \
+  -subj "/CN=mtls-root-ca" \
+  -out ca.crt
+----
+
+=== Criar Certificado do Gateway
+
+[source,bash]
+----
+openssl genrsa -out gateway.key 2048
+
+openssl req -new -key gateway.key \
+  -out gateway.csr \
+  -subj "/CN=api.example.com"
+
+openssl x509 -req -in gateway.csr \
+  -CA ca.crt -CAkey ca.key \
+  -CAcreateserial \
+  -out gateway.crt \
+  -days 825 -sha256
+----
+
+=== Criar Certificado do Cliente
+
+[source,bash]
+----
+openssl genrsa -out client.key 2048
+
+openssl req -new -key client.key \
+  -out client.csr \
+  -subj "/CN=cliente123"
+
+openssl x509 -req -in client.csr \
+  -CA ca.crt -CAkey ca.key \
+  -CAcreateserial \
+  -out client.crt \
+  -days 825 -sha256
+----
+
+== Criando Secrets no OpenShift
+
+[source,bash]
+----
+oc create secret tls apicast-server-tls \
+  --cert=gateway.crt --key=gateway.key \
+  -n 3scale-gateway
+
+oc create secret generic apicast-client-ca \
+  --from-file=ca.crt \
+  -n 3scale-gateway
+----
+
+== Criando o APIcast (CRD)
+
+Crie o arquivo `apicast-mtls.yaml`:
+
+[source,yaml]
+----
+apiVersion: apps.3scale.net/v1alpha1
+kind: APIcast
+metadata:
+  name: apicast-mtls
+  namespace: 3scale-gateway
+spec:
+  image: registry.redhat.io/3scale-amp2/apicast-gateway-rhel8:3scale2.16
+  replicas: 2
+
+  exposedHost:
+    host: api.example.com
+    tls:
+      enabled: true
+
+  deployment:
+    environment:
+      - name: APICAST_HTTPS_PORT
+        value: "8443"
+      - name: APICAST_HTTPS_CERTIFICATE
+        value: "/var/run/secrets/tls/tls.crt"
+      - name: APICAST_HTTPS_CERTIFICATE_KEY
+        value: "/var/run/secrets/tls/tls.key"
+      - name: APICAST_HTTPS_VERIFY_CLIENT
+        value: "on"
+      - name: APICAST_HTTPS_CLIENT_CERTIFICATE
+        value: "/var/run/secrets/clientca/ca.crt"
+
+    volumeMounts:
+      - name: server-tls
+        mountPath: /var/run/secrets/tls
+        readOnly: true
+      - name: clientca
+        mountPath: /var/run/secrets/clientca
+        readOnly: true
+
+    volumes:
+      - name: server-tls
+        secret:
+          secretName: apicast-server-tls
+      - name: clientca
+        secret:
+          secretName: apicast-client-ca
+----
+
+Aplicar:
+
+[source,bash]
+----
+oc apply -f apicast-mtls.yaml
+----
+
+== Criando a Route (passthrough)
+
+Crie `route-mtls.yaml`:
+
+[source,yaml]
+----
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: apicast-mtls
+  namespace: 3scale-gateway
+spec:
+  host: api.example.com
+  to:
+    kind: Service
+    name: apicast-mtls
+  tls:
+    termination: passthrough
+----
+
+Aplicar:
+
+[source,bash]
+----
+oc apply -f route-mtls.yaml
+----
+
+== Testando o mTLS
+
+=== Teste OK (com certificado válido)
+
+[source,bash]
+----
+curl -v https://api.example.com \
+  --cert client.crt \
+  --key client.key \
+  --cacert ca.crt
+----
+
+=== Teste Falho (sem certificado)
+
+[source,bash]
+----
+curl -v https://api.example.com --cacert ca.crt
+----
+
+Resultado esperado:
+
+----
+400 No required SSL certificate was sent
+----
+
+== (Opcional) Usando o Certificado como Identidade da Application
+
+Se quiser substituir `user_key` ou `client_id` e autenticar pelo DN do certificado, use esta policy custom.
+
+=== Criar o arquivo policy.lua
+
+[source,lua]
+----
+local _M = require('apicast.policy').new('mtls-auth', '1.0')
+
+function _M:rewrite(context)
+  local dn = ngx.var.ssl_client_s_dn
+
+  if not dn or dn == '' then
+    ngx.status = 400
+    ngx.say("Client certificate required")
+    return ngx.exit(400)
+  end
+
+  context.credentials = { app_id = dn }
+end
+
+return _M
+----
+
+=== Criar ConfigMap
+
+[source,bash]
+----
+oc create configmap apicast-policy-mtls \
+  --from-file=init.lua=policy.lua \
+  -n 3scale-gateway
+----
+
+=== Adicionar no APIcast CR
+
+Inclua no spec:
+
+[source,yaml]
+----
+policies:
+  - name: apicast-policy-mtls
+    version: "1.0"
+    configuration: {}
+----
+
+=== Criar Application no 3scale:
+
+Defina o app_id como:
+
+----
+CN=cliente123
+----
+
+=== Resumindo o onboarding de um novo cliente
+
+. Definir a identidade do cliente no certificado (padrão de CN/DN).
+. Emitir/assinar o certificado do cliente via sua CA (ou confiar na CA do cliente).
+. Garantir que a CA está no secret apicast-client-ca (ou já estava).
+. Criar uma Application no 3scale:
+. Associar ao Product/Plano certo.
+. Definir app_id = CN/DN que você usou.
+. Entregar para o cliente:
+.. client.crt
+.. ca.crt (do gateway)
+. Testar com o cliente:
+.. Chamada com client cert → 200.
+.. Chamada sem client cert → 400 (sem certificado).
+.. Chamada com cert válido mas sem Application correspondente → 403 (não autorizado pelo 3scale).
+
+== Conclusão
+
+Neste workshop você configurou:
+
+* mTLS direto no APIcast (Modelo B)
+* Secrets com certificados
+* Gateway servindo HTTPS/8443
+* Route em passthrough
+* Testes com curl
+* (Opcional) Autenticação baseada no DN do certificado
+
+Next steps:
+
+* Automatização com Vault ou cert-manager
+* Rotação automática de certificados
+* Política avançada de validação
+* Suporte a múltiplas CAs e parceiros B2B

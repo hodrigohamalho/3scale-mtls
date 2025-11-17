@@ -1,0 +1,18 @@
+apiVersion: apps.3scale.net/v1alpha1
+kind: APIManager
+metadata:
+  name: apix
+  namespace: mtls
+spec:
+  wildcardDomain: apps.cluster-nqc9d.nqc9d.sandbox5571.opentlc.com
+
+  monitoring:
+    enabled: false
+
+  resourceRequirementsEnabled: false
+
+  system:
+    fileStorage:
+      persistentVolumeClaim:
+        # opcional: pode colocar storageClassName se quiser
+        storageClassName: gp3-csi
