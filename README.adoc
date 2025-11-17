@@ -32,8 +32,11 @@ O fluxo é:
 
 == Instalando o 3Scale (Non Prod)
 
+[source,bash]
+----
 oc create -f 01-system-storage.yaml
 oc create -f 02-apimanager-cr.yaml
+----
 
 == Criando os Certificados
 
